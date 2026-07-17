@@ -1,0 +1,1 @@
+UPDATE public.credits SET balance = balance + 500 WHERE user_id = '6d438cfb-4c8e-4379-9a1b-fe57bae6fa6f';
