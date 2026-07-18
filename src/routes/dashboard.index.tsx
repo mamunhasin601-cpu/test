@@ -154,7 +154,7 @@ function NewGenerationPage() {
       const interval = setInterval(() => setProgress((p) => Math.min(90, p + 4)), 700);
       try {
         const res = await generateFn({
-          data: { prompt, category, marketplace, inputImageUrl, scenario, angle, numVariants },
+          data: { prompt, category, marketplace, inputImageUrl, scenario, angle, contentType, numVariants },
         });
         setProgress(100);
         return res;
