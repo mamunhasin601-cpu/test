@@ -9,6 +9,11 @@ const InputSchema = z.object({
   // товар с фото в новую сцену), без исходного фото identity товара сохранить нечем.
   inputImageUrl: z.string().url(),
   marketplace: z.enum(["wb", "ozon", "ym"]).default("wb"),
+  // Сценарий демонстрации товара и ракурс — шаги визарда (см. dashboard.index.tsx)
+  scenario: z.enum(["white_bg", "flat_lay", "in_hand", "lifestyle"]).default("white_bg"),
+  angle: z.enum(["auto", "low", "side", "three_quarter", "in_hand", "macro"]).default("auto"),
+  // Сколько параллельных вариантов сгенерировать за один запуск (1-4)
+  numVariants: z.number().int().min(1).max(4).default(1),
 });
 
 type Marketplace = "wb" | "ozon" | "ym";
@@ -61,11 +66,34 @@ const PRESETS: Record<Marketplace, MarketplacePreset> = {
   },
 };
 
-const CREDITS_COST = 15;
+// Тексты для шага "Сценарий" визарда — что именно происходит с товаром в кадре
+const SCENARIO_RULES: Record<string, string> = {
+  white_bg:
+    "Классическая предметная фотография — товар на чистом нейтральном/белом фоне, базовый кадр для карточки маркетплейса.",
+  flat_lay:
+    "Вид строго сверху (flat lay) — товар (и уместные комплектующие/аксессуары к нему) разложен на плоской поверхности, камера смотрит вертикально вниз.",
+  in_hand:
+    "Товар в руках человека — кадр демонстрирует реальный размер и способ использования; в кадре видны руки/часть тела, лицо не обязательно показывать.",
+  lifestyle:
+    "Товар в подходящей жизненной обстановке (интерьер, природа, рабочее место — выбери сцену, естественную именно для этой категории товара), стиль lifestyle-фотографии, не студийный.",
+};
+
+// Тексты для шага "Ракурс" визарда
+const ANGLE_RULES: Record<string, string> = {
+  auto: "Ракурс выбери сам — наиболее выигрышный именно для этого товара.",
+  low: "Низкий ракурс (hero-shot) — камера немного снизу, товар выглядит крупнее и внушительнее.",
+  side: "Ракурс строго сбоку (профиль) — показывает толщину и боковую форму товара.",
+  three_quarter: "Ракурс 3/4 — универсальный рекламный угол, показывает и фронт, и объём.",
+  in_hand: "Ракурс, при котором явно виден масштаб товара относительно руки или тела человека.",
+  macro: "Макро-план — крупный кадр с акцентом на текстуру материала и мелкие детали.",
+};
+
+const CREDITS_COST_PER_VARIANT = 15;
+
+type GenVariant = { id: string; outputUrl: string };
 
 type GenResult = {
-  id: string;
-  outputUrl: string;
+  variants: GenVariant[];
   balance: number;
   analysis: string;
   warnings: string[];
@@ -78,6 +106,26 @@ type AnalysisResult = {
   fallbackUsed: boolean;
   errorCode?: "empty_input" | "empty_analysis" | "timeout" | "moderation" | "unknown";
 };
+
+// Шаг "AI-анализ" визарда — только анализ, кредиты не списываются. Пользователь
+// видит распознанный товар и может доработать текстовое описание (prompt) перед
+// тем, как двигаться дальше по шагам визарда.
+export const analyzeProductStep = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) =>
+    z
+      .object({
+        prompt: z.string().min(1).max(2000),
+        category: z.string().max(64).optional(),
+        inputImageUrl: z.string().url(),
+      })
+      .parse(data),
+  )
+  .handler(async ({ data }): Promise<AnalysisResult> => {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY is not configured");
+    return analyzeProduct(apiKey, data.prompt, data.category, data.inputImageUrl);
+  });
 
 export const generateCard = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -110,156 +158,193 @@ export const generateCard = createServerFn({ method: "POST" })
     }
 
     // Step 2: Spend credits — analysis succeeded, we now commit to generating.
+    // Списываем сразу за все запрошенные варианты одним вызовом.
+    const totalCost = CREDITS_COST_PER_VARIANT * data.numVariants;
     const { data: newBalance, error: spendErr } = await supabase.rpc("spend_credits", {
-      _amount: CREDITS_COST,
+      _amount: totalCost,
     });
     if (spendErr) {
       if (spendErr.message.includes("insufficient_credits")) throw new Error("insufficient_credits");
       throw new Error(spendErr.message);
     }
 
-    const { data: gen, error: insErr } = await supabase
-      .from("generations")
-      .insert({
-        user_id: userId,
-        prompt: data.prompt,
-        category: data.category ?? null,
-        input_image_url: data.inputImageUrl ?? null,
-        status: "processing",
-        credits_cost: CREDITS_COST,
-      })
-      .select("id")
-      .single();
-    if (insErr || !gen) throw new Error(insErr?.message ?? "insert_failed");
+    const preset = PRESETS[data.marketplace];
+    const imagePrompt = buildHeroCellPrompt(
+      analysisResult.analysis,
+      data.prompt,
+      preset,
+      data.scenario,
+      data.angle,
+    );
+    console.log(
+      "[generateCard] marketplace:",
+      data.marketplace,
+      "aspectRatio:",
+      preset.aspectRatio,
+      "scenario:",
+      data.scenario,
+      "angle:",
+      data.angle,
+      "numVariants:",
+      data.numVariants,
+      "prompt_length:",
+      imagePrompt.length,
+    );
 
-    try {
-      const preset = PRESETS[data.marketplace];
-      const imagePrompt = buildHeroCellPrompt(analysisResult.analysis, data.prompt, preset);
-      console.log(
-        "[generateCard] marketplace:",
-        data.marketplace,
-        "aspectRatio:",
-        preset.aspectRatio,
-        "prompt_length:",
-        imagePrompt.length,
-      );
+    const variants: GenVariant[] = [];
 
-      // img2img через OpenRouter: передаём исходное фото товара как визуальную
-      // основу, а не только текстовое описание. gemini-3.1-flash-image-preview
-      // ("Nano Banana 2") переносит РЕАЛЬНЫЙ товар с фото в новую сцену, сохраняя
-      // форму/цвет/детали — в отличие от прежнего text-to-image (gpt-image-2),
-      // который рисовал товар заново по описанию аналитика.
-      // OpenRouter отдаёт картинки только через /v1/chat/completions с
-      // modalities: ["image","text"] — отдельного /v1/images/generations
-      // эндпоинта, как у Lovable AI Gateway / OpenAI, здесь нет.
-      const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          // Необязательные, но рекомендованные OpenRouter атрибуты запроса —
-          // не влияют на работу, можно заменить/убрать.
-          "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://exact-match.app",
-          "X-Title": "Exact Match",
-        },
-        body: JSON.stringify({
-          model: "google/gemini-3.1-flash-image-preview",
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "image_url", image_url: { url: data.inputImageUrl } },
-                { type: "text", text: imagePrompt },
-              ],
-            },
-          ],
-          modalities: ["image", "text"],
-          image_config: { aspect_ratio: preset.aspectRatio },
-        }),
-      });
+    // Генерируем варианты по одному — каждый идёт своей строкой в `generations`,
+    // чтобы у пользователя была честная история (и можно было отследить, какой
+    // именно вариант не удался, если что-то пойдёт не так на одном из них).
+    for (let i = 0; i < data.numVariants; i++) {
+      const { data: gen, error: insErr } = await supabase
+        .from("generations")
+        .insert({
+          user_id: userId,
+          prompt: data.prompt,
+          category: data.category ?? null,
+          input_image_url: data.inputImageUrl ?? null,
+          status: "processing",
+          credits_cost: CREDITS_COST_PER_VARIANT,
+        })
+        .select("id")
+        .single();
+      if (insErr || !gen) throw new Error(insErr?.message ?? "insert_failed");
 
-      if (!resp.ok) {
-        const errText = await resp.text();
-        if (resp.status === 429) throw new Error("rate_limited");
-        if (resp.status === 402) throw new Error("ai_credits_exhausted");
-        if (
-          resp.status === 400 &&
-          (errText.includes("content_policy") || errText.includes("safety"))
-        ) {
-          throw new Error("image_moderation_blocked");
-        }
-        throw new Error(`ai_error_${resp.status}: ${errText.slice(0, 200)}`);
+      try {
+        const b64 = await callImageModel(apiKey, imagePrompt, data.inputImageUrl, preset.aspectRatio);
+
+        const mime = "image/png";
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+        const path = `${userId}/${gen.id}.png`;
+        const { error: upErr } = await supabase.storage
+          .from("generations")
+          .upload(path, bytes, { contentType: mime, upsert: true });
+        if (upErr) throw new Error(`storage_error: ${upErr.message}`);
+
+        await supabase
+          .from("generations")
+          .update({ status: "done", output_image_url: path, analysis: analysisResult.analysis })
+          .eq("id", gen.id);
+
+        const { data: signed } = await supabase.storage
+          .from("generations")
+          .createSignedUrl(path, 60 * 60);
+
+        variants.push({ id: gen.id, outputUrl: signed?.signedUrl ?? "" });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error("[generateCard] variant_failed", {
+          variantIndex: i,
+          category: data.category,
+          totalMs: Date.now() - t0,
+          error: message,
+        });
+        await supabase
+          .from("generations")
+          .update({ status: "failed", error: message })
+          .eq("id", gen.id);
+        // Кредиты за уже потраченные варианты не возвращаем автоматически —
+        // если ни один вариант не получился, это будет 0 успешных ниже, и мы
+        // выбросим ошибку целиком (см. проверку после цикла).
+        if (data.numVariants === 1) throw err;
       }
-
-      // Формат ответа подтверждён документацией OpenRouter для image-generation
-      // моделей: choices[0].message.images[0].image_url.url в виде
-      // data:image/png;base64,.... Остальные ветки оставлены как safety net
-      // на случай смены модели/провайдера без переписывания парсинга.
-      const json = (await resp.json()) as {
-        data?: Array<{ b64_json?: string }>;
-        choices?: Array<{
-          message?: {
-            images?: Array<{ image_url?: { url?: string } }>;
-            content?: Array<{ type?: string; image_url?: { url?: string } }>;
-          };
-        }>;
-      };
-
-      const rawDataUrl =
-        json.choices?.[0]?.message?.images?.[0]?.image_url?.url ??
-        json.choices?.[0]?.message?.content?.find((c) => c.type === "image_url")?.image_url?.url;
-
-      let b64: string | undefined = json.data?.[0]?.b64_json;
-      if (!b64 && rawDataUrl) {
-        // data:image/png;base64,AAAA... -> вытаскиваем чистый base64
-        const match = /^data:[^;]+;base64,(.+)$/.exec(rawDataUrl);
-        b64 = match ? match[1] : rawDataUrl;
-      }
-      if (!b64) throw new Error("no_image_returned");
-
-      const mime = "image/png";
-      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-
-      const path = `${userId}/${gen.id}.png`;
-      const { error: upErr } = await supabase.storage
-        .from("generations")
-        .upload(path, bytes, { contentType: mime, upsert: true });
-      if (upErr) throw new Error(`storage_error: ${upErr.message}`);
-
-      await supabase
-        .from("generations")
-        .update({ status: "done", output_image_url: path, analysis: analysisResult.analysis })
-        .eq("id", gen.id);
-
-      const { data: signed } = await supabase.storage
-        .from("generations")
-        .createSignedUrl(path, 60 * 60);
-
-      console.log("[generateCard] total_ms:", Date.now() - t0);
-
-      return {
-        id: gen.id,
-        outputUrl: signed?.signedUrl ?? "",
-        balance: newBalance as number,
-        analysis: analysisResult.analysis,
-        warnings: analysisResult.warnings,
-      };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("[generateCard] failed", {
-        category: data.category,
-        promptLength: data.prompt.length,
-        hasImage: !!data.inputImageUrl,
-        totalMs: Date.now() - t0,
-        error: message,
-      });
-      await supabase
-        .from("generations")
-        .update({ status: "failed", error: message })
-        .eq("id", gen.id);
-      throw err;
     }
+
+    if (variants.length === 0) {
+      throw new Error("all_variants_failed");
+    }
+
+    console.log("[generateCard] total_ms:", Date.now() - t0, "succeeded:", variants.length);
+
+    return {
+      variants,
+      balance: newBalance as number,
+      analysis: analysisResult.analysis,
+      warnings: analysisResult.warnings,
+    };
   });
+
+// Один вызов модели генерации изображения (img2img через OpenRouter). Вынесен
+// отдельно, чтобы вызывать в цикле для нескольких вариантов за один запуск.
+async function callImageModel(
+  apiKey: string,
+  imagePrompt: string,
+  inputImageUrl: string,
+  aspectRatio: MarketplacePreset["aspectRatio"],
+): Promise<string> {
+  // img2img через OpenRouter: передаём исходное фото товара как визуальную
+  // основу, а не только текстовое описание. gemini-3.1-flash-image-preview
+  // ("Nano Banana 2") переносит РЕАЛЬНЫЙ товар с фото в новую сцену, сохраняя
+  // форму/цвет/детали — в отличие от прежнего text-to-image (gpt-image-2),
+  // который рисовал товар заново по описанию аналитика.
+  // OpenRouter отдаёт картинки только через /v1/chat/completions с
+  // modalities: ["image","text"] — отдельного /v1/images/generations
+  // эндпоинта, как у Lovable AI Gateway / OpenAI, здесь нет.
+  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      // Необязательные, но рекомендованные OpenRouter атрибуты запроса —
+      // не влияют на работу, можно заменить/убрать.
+      "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://exact-match.app",
+      "X-Title": "Exact Match",
+    },
+    body: JSON.stringify({
+      model: "google/gemini-3.1-flash-image-preview",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: inputImageUrl } },
+            { type: "text", text: imagePrompt },
+          ],
+        },
+      ],
+      modalities: ["image", "text"],
+      image_config: { aspect_ratio: aspectRatio },
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    if (resp.status === 429) throw new Error("rate_limited");
+    if (resp.status === 402) throw new Error("ai_credits_exhausted");
+    if (resp.status === 400 && (errText.includes("content_policy") || errText.includes("safety"))) {
+      throw new Error("image_moderation_blocked");
+    }
+    throw new Error(`ai_error_${resp.status}: ${errText.slice(0, 200)}`);
+  }
+
+  // Формат ответа подтверждён документацией OpenRouter для image-generation
+  // моделей: choices[0].message.images[0].image_url.url в виде
+  // data:image/png;base64,.... Остальные ветки оставлены как safety net
+  // на случай смены модели/провайдера без переписывания парсинга.
+  const json = (await resp.json()) as {
+    data?: Array<{ b64_json?: string }>;
+    choices?: Array<{
+      message?: {
+        images?: Array<{ image_url?: { url?: string } }>;
+        content?: Array<{ type?: string; image_url?: { url?: string } }>;
+      };
+    }>;
+  };
+
+  const rawDataUrl =
+    json.choices?.[0]?.message?.images?.[0]?.image_url?.url ??
+    json.choices?.[0]?.message?.content?.find((c) => c.type === "image_url")?.image_url?.url;
+
+  let b64: string | undefined = json.data?.[0]?.b64_json;
+  if (!b64 && rawDataUrl) {
+    // data:image/png;base64,AAAA... -> вытаскиваем чистый base64
+    const match = /^data:[^;]+;base64,(.+)$/.exec(rawDataUrl);
+    b64 = match ? match[1] : rawDataUrl;
+  }
+  if (!b64) throw new Error("no_image_returned");
+  return b64;
+}
 
 async function analyzeProduct(
   apiKey: string,
@@ -446,6 +531,8 @@ function buildHeroCellPrompt(
   analysis: string,
   userPrompt: string,
   preset: MarketplacePreset,
+  scenario: string,
+  angle: string,
 ): string {
   const textBlock = preset.allowText
     ? `ОРИЕНТИР ПО СТИЛЮ:
@@ -471,10 +558,23 @@ function buildHeroCellPrompt(
 
   const marketplaceRules = preset.extraRules.map((r) => `— ${r}`).join("\n");
 
+  const scenarioText = SCENARIO_RULES[scenario] ?? SCENARIO_RULES.white_bg;
+  const angleText = ANGLE_RULES[angle] ?? ANGLE_RULES.auto;
+  // Примечание: для Ozon/ЯМ требования маркетплейса (чистый белый фон, без
+  // текста) — приоритетнее сценария. Фронтенд ограничивает выбор сценария на
+  // этих площадках до "белый фон", но на всякий случай явно проговариваем
+  // порядок приоритета в самом промпте.
+  const sceneBlock = `СЦЕНАРИЙ И РАКУРС:
+— Сцена: ${scenarioText}
+— Ракурс: ${angleText}
+Если сценарий противоречит требованиям маркетплейса выше (например, площадка требует строго белый фон) — требования маркетплейса ИМЕЮТ ПРИОРИТЕТ.`;
+
   return `Ты — арт-директор и дизайнер главной (hero) карточки товара для российских маркетплейсов. К этому запросу приложено РЕАЛЬНОЕ ФОТО товара — твоя задача НЕ нарисовать похожий товар с нуля, а ПЕРЕНЕСТИ именно ЭТОТ товар с фото в новую студийную сцену/композицию. Результат — ОДНА карточка, фотореалистичная предметная съёмка (не иллюстрация, не flat design), студийный свет, коммерческий уровень качества.
 
 ТРЕБОВАНИЯ МАРКЕТПЛЕЙСА (СОБЛЮДАТЬ СТРОГО):
 ${marketplaceRules}
+
+${sceneBlock}
 
 ${textBlock}
 
