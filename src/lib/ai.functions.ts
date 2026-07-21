@@ -20,7 +20,23 @@ const InputSchema = z.object({
   contentType: z.enum(["photo", "infographic"]).default("photo"),
   // Сколько параллельных вариантов сгенерировать за один запуск (1-4)
   numVariants: z.number().int().min(1).max(4).default(1),
+  // Тестовый режим: сгенерировать один и тот же кадр параллельно тремя
+  // разными AI-моделями, чтобы сравнить качество/цену вживую. Если true —
+  // numVariants игнорируется, вариантов ровно столько, сколько в COMPARE_MODELS.
+  compareModels: z.boolean().default(false),
 });
+
+// Модели для тестового режима "Сравнить модели" — все доступны через тот же
+// OpenRouter, без смены инфраструктуры. Цены указаны на момент подключения
+// (июль 2026), могут измениться — сверяйте на openrouter.ai/models.
+const COMPARE_MODELS = [
+  { id: "google/gemini-3.1-flash-image-preview", label: "Gemini 3.1 Flash (Nano Banana 2)", priceHint: "~$0.07/шт" },
+  { id: "black-forest-labs/flux-kontext-pro", label: "FLUX.1 Kontext Pro", priceHint: "~$0.04/шт" },
+  { id: "bytedance/seedream-4.5", label: "Seedream 4.5", priceHint: "~$0.03/шт" },
+] as const;
+
+// Модель по умолчанию для обычной (не сравнительной) генерации
+const DEFAULT_MODEL = "google/gemini-3.1-flash-image-preview";
 
 type Marketplace = "wb" | "ozon" | "ym";
 
@@ -96,7 +112,7 @@ const ANGLE_RULES: Record<string, string> = {
 
 const CREDITS_COST_PER_VARIANT = 15;
 
-type GenVariant = { id: string; outputUrl: string };
+type GenVariant = { id: string; outputUrl: string; modelLabel?: string };
 
 type GenResult = {
   variants: GenVariant[];
@@ -164,8 +180,10 @@ export const generateCard = createServerFn({ method: "POST" })
     }
 
     // Step 2: Spend credits — analysis succeeded, we now commit to generating.
-    // Списываем сразу за все запрошенные варианты одним вызовом.
-    const totalCost = CREDITS_COST_PER_VARIANT * data.numVariants;
+    // Списываем сразу за все запрошенные варианты одним вызовом. В режиме
+    // сравнения моделей вариантов ровно столько, сколько моделей в COMPARE_MODELS.
+    const variantCount = data.compareModels ? COMPARE_MODELS.length : data.numVariants;
+    const totalCost = CREDITS_COST_PER_VARIANT * variantCount;
     const { data: newBalance, error: spendErr } = await supabase.rpc("spend_credits", {
       _amount: totalCost,
     });
@@ -198,16 +216,25 @@ export const generateCard = createServerFn({ method: "POST" })
       data.angle,
       "numVariants:",
       data.numVariants,
+      "compareModels:",
+      data.compareModels,
       "prompt_length:",
       imagePrompt.length,
     );
 
     const variants: GenVariant[] = [];
 
+    // В обычном режиме — variantCount одинаковых вызовов одной модели.
+    // В режиме сравнения — по одному вызову на каждую модель из COMPARE_MODELS.
+    const jobs: { model: string; label?: string }[] = data.compareModels
+      ? COMPARE_MODELS.map((m) => ({ model: m.id, label: m.label }))
+      : Array.from({ length: data.numVariants }, () => ({ model: DEFAULT_MODEL }));
+
     // Генерируем варианты по одному — каждый идёт своей строкой в `generations`,
     // чтобы у пользователя была честная история (и можно было отследить, какой
     // именно вариант не удался, если что-то пойдёт не так на одном из них).
-    for (let i = 0; i < data.numVariants; i++) {
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
       const { data: gen, error: insErr } = await supabase
         .from("generations")
         .insert({
@@ -223,7 +250,7 @@ export const generateCard = createServerFn({ method: "POST" })
       if (insErr || !gen) throw new Error(insErr?.message ?? "insert_failed");
 
       try {
-        const b64 = await callImageModel(apiKey, imagePrompt, data.inputImageUrl, preset.aspectRatio);
+        const b64 = await callImageModel(apiKey, imagePrompt, data.inputImageUrl, preset.aspectRatio, job.model);
 
         const mime = "image/png";
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
@@ -243,7 +270,7 @@ export const generateCard = createServerFn({ method: "POST" })
           .from("generations")
           .createSignedUrl(path, 60 * 60);
 
-        variants.push({ id: gen.id, outputUrl: signed?.signedUrl ?? "" });
+        variants.push({ id: gen.id, outputUrl: signed?.signedUrl ?? "", modelLabel: job.label });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error("[generateCard] variant_failed", {
@@ -259,7 +286,7 @@ export const generateCard = createServerFn({ method: "POST" })
         // Кредиты за уже потраченные варианты не возвращаем автоматически —
         // если ни один вариант не получился, это будет 0 успешных ниже, и мы
         // выбросим ошибку целиком (см. проверку после цикла).
-        if (data.numVariants === 1) throw err;
+        if (jobs.length === 1) throw err;
       }
     }
 
@@ -284,12 +311,12 @@ async function callImageModel(
   imagePrompt: string,
   inputImageUrl: string,
   aspectRatio: MarketplacePreset["aspectRatio"],
+  model: string,
 ): Promise<string> {
   // img2img через OpenRouter: передаём исходное фото товара как визуальную
-  // основу, а не только текстовое описание. gemini-3.1-flash-image-preview
-  // ("Nano Banana 2") переносит РЕАЛЬНЫЙ товар с фото в новую сцену, сохраняя
-  // форму/цвет/детали — в отличие от прежнего text-to-image (gpt-image-2),
-  // который рисовал товар заново по описанию аналитика.
+  // основу, а не только текстовое описание. Модель передаётся параметром —
+  // см. COMPARE_MODELS/DEFAULT_MODEL — чтобы можно было сравнивать несколько
+  // провайдеров без изменения самой функции вызова.
   // OpenRouter отдаёт картинки только через /v1/chat/completions с
   // modalities: ["image","text"] — отдельного /v1/images/generations
   // эндпоинта, как у Lovable AI Gateway / OpenAI, здесь нет.
@@ -304,7 +331,7 @@ async function callImageModel(
       "X-Title": "Exact Match",
     },
     body: JSON.stringify({
-      model: "google/gemini-3.1-flash-image-preview",
+      model,
       messages: [
         {
           role: "user",
