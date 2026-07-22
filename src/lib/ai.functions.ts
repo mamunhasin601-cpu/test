@@ -35,8 +35,14 @@ const COMPARE_MODELS = [
   { id: "bytedance-seed/seedream-4.5", label: "Seedream 4.5", priceHint: "~$0.04/шт" },
 ] as const;
 
-// Модель по умолчанию для обычной (не сравнительной) генерации
-const DEFAULT_MODEL = "google/gemini-3.1-flash-image-preview";
+// Основная модель для обычной генерации + запасные (пробуем по порядку, если
+// предыдущая недоступна/упала). Дешевле, чем Gemini, но Gemini остаётся
+// последним в цепочке как самый проверенный вариант.
+const MODEL_FALLBACK_CHAIN = [
+  { id: "black-forest-labs/flux.2-pro", label: "FLUX.2 Pro" },
+  { id: "bytedance-seed/seedream-4.5", label: "Seedream 4.5" },
+  { id: "google/gemini-3.1-flash-image-preview", label: "Gemini 3.1 Flash (Nano Banana 2)" },
+] as const;
 
 type Marketplace = "wb" | "ozon" | "ym";
 
@@ -224,11 +230,13 @@ export const generateCard = createServerFn({ method: "POST" })
 
     const variants: GenVariant[] = [];
 
-    // В обычном режиме — variantCount одинаковых вызовов одной модели.
-    // В режиме сравнения — по одному вызову на каждую модель из COMPARE_MODELS.
-    const jobs: { model: string; label?: string }[] = data.compareModels
+    // В обычном режиме — variantCount вызовов с автоматическим фолбэком по
+    // цепочке MODEL_FALLBACK_CHAIN (model: null сигнализирует "использовать
+    // цепочку"). В режиме сравнения — по одному вызову на каждую модель из
+    // COMPARE_MODELS, без фолбэка (сравниваем именно эти модели, а не замену).
+    const jobs: { model: string | null; label?: string }[] = data.compareModels
       ? COMPARE_MODELS.map((m) => ({ model: m.id, label: m.label }))
-      : Array.from({ length: data.numVariants }, () => ({ model: DEFAULT_MODEL }));
+      : Array.from({ length: data.numVariants }, () => ({ model: null }));
 
     // Генерируем варианты по одному — каждый идёт своей строкой в `generations`,
     // чтобы у пользователя была честная история (и можно было отследить, какой
@@ -250,7 +258,28 @@ export const generateCard = createServerFn({ method: "POST" })
       if (insErr || !gen) throw new Error(insErr?.message ?? "insert_failed");
 
       try {
-        const b64 = await callImageModel(apiKey, imagePrompt, data.inputImageUrl, preset.aspectRatio, job.model);
+        // Если у job задана конкретная модель (режим сравнения) — используем
+        // только её, без фолбэка. Иначе (обычная генерация) — пробуем модели
+        // из MODEL_FALLBACK_CHAIN по порядку, пока одна не сработает.
+        const chain = job.model ? [{ id: job.model, label: job.label }] : MODEL_FALLBACK_CHAIN;
+        let b64: string | undefined;
+        let usedLabel: string | undefined = job.label;
+        let lastErr: unknown;
+        for (const candidate of chain) {
+          try {
+            b64 = await callImageModel(apiKey, imagePrompt, data.inputImageUrl, preset.aspectRatio, candidate.id);
+            usedLabel = job.model ? job.label : candidate.label;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.error("[generateCard] model_attempt_failed", {
+              model: candidate.id,
+              variantIndex: i,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        if (!b64) throw lastErr instanceof Error ? lastErr : new Error("all_models_failed");
 
         const mime = "image/png";
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
@@ -270,7 +299,7 @@ export const generateCard = createServerFn({ method: "POST" })
           .from("generations")
           .createSignedUrl(path, 60 * 60);
 
-        variants.push({ id: gen.id, outputUrl: signed?.signedUrl ?? "", modelLabel: job.label });
+        variants.push({ id: gen.id, outputUrl: signed?.signedUrl ?? "", modelLabel: usedLabel });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error("[generateCard] variant_failed", {

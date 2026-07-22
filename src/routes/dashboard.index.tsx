@@ -95,6 +95,7 @@ function NewGenerationPage() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
   const [overlayFor, setOverlayFor] = useState<string | null>(null);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
 
   // Ozon / ЯМ требуют строго чистый фон без сцены — ограничиваем выбор сценария
   const scenarioAllowed: Scenario[] =
@@ -209,6 +210,7 @@ function NewGenerationPage() {
     setVariants([]);
     setWarnings([]);
     setOverlayFor(null);
+    setLightboxUrl(null);
   };
 
   const showingResults = variants.length > 0 && !generateMutation.isPending;
@@ -664,14 +666,13 @@ function NewGenerationPage() {
             </Button>
           </div>
 
-          <div className={`grid gap-6 ${variants.length > 1 ? "sm:grid-cols-2" : ""}`}>
+          <div
+            className={`grid gap-6 ${
+              variants.length > 1 ? "sm:grid-cols-2 lg:grid-cols-3" : "mx-auto max-w-sm"
+            }`}
+          >
             {variants.map((v) => (
               <div key={v.id} className="space-y-3">
-                {v.modelLabel && (
-                  <div className="inline-flex items-center rounded-full border border-border/60 bg-background/60 px-3 py-1 text-xs font-medium">
-                    {v.modelLabel}
-                  </div>
-                )}
                 {overlayFor === v.id ? (
                   <div style={{ containerType: "inline-size" as const }}>
                     <CardOverlayEditor
@@ -682,7 +683,24 @@ function NewGenerationPage() {
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    <img src={v.outputUrl} alt="" className="w-full rounded-xl border border-border/60" />
+                    <button
+                      type="button"
+                      onClick={() => setLightboxUrl(v.outputUrl)}
+                      className="block w-full cursor-zoom-in"
+                      title={l ? "Нажмите, чтобы увеличить" : "Click to enlarge"}
+                    >
+                      <img
+                        src={v.outputUrl}
+                        alt=""
+                        className="aspect-[3/4] w-full rounded-xl border border-border/60 object-cover"
+                      />
+                    </button>
+                    {v.modelLabel && (
+                      <div className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+                        <Sparkles className="h-3 w-3" />
+                        {v.modelLabel}
+                      </div>
+                    )}
                     <div className="flex gap-2">
                       <Button variant="outline" size="sm" asChild>
                         <a href={v.outputUrl} download>
@@ -700,6 +718,19 @@ function NewGenerationPage() {
             ))}
           </div>
         </Card>
+      )}
+
+      {lightboxUrl && (
+        <div
+          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/90 p-6"
+          onClick={() => setLightboxUrl(null)}
+        >
+          <img
+            src={lightboxUrl}
+            alt=""
+            className="max-h-full max-w-full rounded-lg object-contain"
+          />
+        </div>
       )}
 
       {generateMutation.isError && !generateMutation.isPending && (
