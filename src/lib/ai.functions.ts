@@ -31,8 +31,8 @@ const InputSchema = z.object({
 // (июль 2026), могут измениться — сверяйте на openrouter.ai/models.
 const COMPARE_MODELS = [
   { id: "google/gemini-3.1-flash-image-preview", label: "Gemini 3.1 Flash (Nano Banana 2)", priceHint: "~$0.07/шт" },
-  { id: "black-forest-labs/flux-kontext-pro", label: "FLUX.1 Kontext Pro", priceHint: "~$0.04/шт" },
-  { id: "bytedance/seedream-4.5", label: "Seedream 4.5", priceHint: "~$0.03/шт" },
+  { id: "black-forest-labs/flux.2-pro", label: "FLUX.2 Pro", priceHint: "~$0.04/шт" },
+  { id: "bytedance-seed/seedream-4.5", label: "Seedream 4.5", priceHint: "~$0.04/шт" },
 ] as const;
 
 // Модель по умолчанию для обычной (не сравнительной) генерации
@@ -283,10 +283,34 @@ export const generateCard = createServerFn({ method: "POST" })
           .from("generations")
           .update({ status: "failed", error: message })
           .eq("id", gen.id);
-        // Кредиты за уже потраченные варианты не возвращаем автоматически —
-        // если ни один вариант не получился, это будет 0 успешных ниже, и мы
-        // выбросим ошибку целиком (см. проверку после цикла).
-        if (jobs.length === 1) throw err;
+        // Раньше здесь был ранний throw для единственного варианта — из-за
+        // этого деньги за него не возвращались вообще (обычная генерация без
+        // сравнения моделей). Теперь просто продолжаем — цикл завершится,
+        // ниже единая логика посчитает failedCount и вернёт кредиты, а если
+        // успешных вариантов 0 — бросит all_variants_failed уже ПОСЛЕ возврата.
+      }
+    }
+
+    // Возврат кредитов за неудавшиеся варианты. Раньше кредиты списывались
+    // сразу за все jobs.length штук, а за упавшие — не возвращались вообще.
+    // Именно из-за этого при частичном сбое (например, в режиме сравнения
+    // моделей, когда 2 из 3 моделей не ответили) с пользователя списывалось
+    // за 3, а получал он 1 — деньги за 2 неудавшихся сгорали молча. Теперь
+    // считаем разницу и возвращаем её.
+    const failedCount = jobs.length - variants.length;
+    let finalBalance = newBalance as number;
+    if (failedCount > 0) {
+      const refundAmount = CREDITS_COST_PER_VARIANT * failedCount;
+      const { data: refundedBalance, error: refundErr } = await supabase.rpc("refund_credits", {
+        _amount: refundAmount,
+      });
+      if (refundErr) {
+        // Не роняем весь запрос из-за неудавшегося возврата — пользователь
+        // и так получит хотя бы то, что сгенерировалось; ошибку логируем,
+        // чтобы можно было вернуть кредиты вручную при разборе инцидента.
+        console.error("[generateCard] refund_failed", { failedCount, refundAmount, error: refundErr.message });
+      } else {
+        finalBalance = refundedBalance as number;
       }
     }
 
@@ -294,18 +318,31 @@ export const generateCard = createServerFn({ method: "POST" })
       throw new Error("all_variants_failed");
     }
 
-    console.log("[generateCard] total_ms:", Date.now() - t0, "succeeded:", variants.length);
+    console.log(
+      "[generateCard] total_ms:",
+      Date.now() - t0,
+      "succeeded:",
+      variants.length,
+      "failed:",
+      failedCount,
+    );
 
     return {
       variants,
-      balance: newBalance as number,
+      balance: finalBalance,
       analysis: analysisResult.analysis,
-      warnings: analysisResult.warnings,
+      warnings:
+        failedCount > 0
+          ? [
+              ...analysisResult.warnings,
+              `${failedCount} из ${jobs.length} вариантов не удалось сгенерировать — кредиты за них возвращены.`,
+            ]
+          : analysisResult.warnings,
     };
   });
 
 // Один вызов модели генерации изображения (img2img через OpenRouter). Вынесен
-// отдельно, чтобы вызывать в цикле для нескольких вариантов за один запуск.
+// отдельно, чтобы вызывать в цикле для нескольких вариантов/моделей за один запуск.
 async function callImageModel(
   apiKey: string,
   imagePrompt: string,
@@ -313,36 +350,26 @@ async function callImageModel(
   aspectRatio: MarketplacePreset["aspectRatio"],
   model: string,
 ): Promise<string> {
-  // img2img через OpenRouter: передаём исходное фото товара как визуальную
-  // основу, а не только текстовое описание. Модель передаётся параметром —
-  // см. COMPARE_MODELS/DEFAULT_MODEL — чтобы можно было сравнивать несколько
-  // провайдеров без изменения самой функции вызова.
-  // OpenRouter отдаёт картинки только через /v1/chat/completions с
-  // modalities: ["image","text"] — отдельного /v1/images/generations
-  // эндпоинта, как у Lovable AI Gateway / OpenAI, здесь нет.
-  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  // Официальный выделенный Image API OpenRouter: POST /api/v1/images (НЕ
+  // /chat/completions — это отдельный, унифицированный для всех
+  // image-моделей эндпоинт с нормализованными параметрами aspect_ratio и
+  // input_references для img2img). Работает одинаково для Gemini, FLUX,
+  // Seedream и остальных — раньше здесь был chat/completions-формат, который
+  // подходит только части моделей (в основном Gemini), из-за чего FLUX/Seedream
+  // в режиме сравнения падали с ошибкой.
+  const resp = await fetch("https://openrouter.ai/api/v1/images", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      // Необязательные, но рекомендованные OpenRouter атрибуты запроса —
-      // не влияют на работу, можно заменить/убрать.
       "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://exact-match.app",
       "X-Title": "Exact Match",
     },
     body: JSON.stringify({
       model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: inputImageUrl } },
-            { type: "text", text: imagePrompt },
-          ],
-        },
-      ],
-      modalities: ["image", "text"],
-      image_config: { aspect_ratio: aspectRatio },
+      prompt: imagePrompt,
+      aspect_ratio: aspectRatio,
+      input_references: [{ type: "image_url", image_url: { url: inputImageUrl } }],
     }),
   });
 
@@ -350,36 +377,16 @@ async function callImageModel(
     const errText = await resp.text();
     if (resp.status === 429) throw new Error("rate_limited");
     if (resp.status === 402) throw new Error("ai_credits_exhausted");
+    if (resp.status === 502) throw new Error("generation_failed_upstream");
     if (resp.status === 400 && (errText.includes("content_policy") || errText.includes("safety"))) {
       throw new Error("image_moderation_blocked");
     }
     throw new Error(`ai_error_${resp.status}: ${errText.slice(0, 200)}`);
   }
 
-  // Формат ответа подтверждён документацией OpenRouter для image-generation
-  // моделей: choices[0].message.images[0].image_url.url в виде
-  // data:image/png;base64,.... Остальные ветки оставлены как safety net
-  // на случай смены модели/провайдера без переписывания парсинга.
-  const json = (await resp.json()) as {
-    data?: Array<{ b64_json?: string }>;
-    choices?: Array<{
-      message?: {
-        images?: Array<{ image_url?: { url?: string } }>;
-        content?: Array<{ type?: string; image_url?: { url?: string } }>;
-      };
-    }>;
-  };
-
-  const rawDataUrl =
-    json.choices?.[0]?.message?.images?.[0]?.image_url?.url ??
-    json.choices?.[0]?.message?.content?.find((c) => c.type === "image_url")?.image_url?.url;
-
-  let b64: string | undefined = json.data?.[0]?.b64_json;
-  if (!b64 && rawDataUrl) {
-    // data:image/png;base64,AAAA... -> вытаскиваем чистый base64
-    const match = /^data:[^;]+;base64,(.+)$/.exec(rawDataUrl);
-    b64 = match ? match[1] : rawDataUrl;
-  }
+  // Формат ответа dedicated Image API: { data: [{ b64_json, media_type }], usage }
+  const json = (await resp.json()) as { data?: Array<{ b64_json?: string }> };
+  const b64 = json.data?.[0]?.b64_json;
   if (!b64) throw new Error("no_image_returned");
   return b64;
 }
