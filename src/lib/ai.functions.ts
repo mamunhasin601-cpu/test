@@ -155,6 +155,159 @@ export const analyzeProductStep = createServerFn({ method: "POST" })
     return analyzeProduct(apiKey, data.prompt, data.category, data.inputImageUrl);
   });
 
+// Шаг "Инфографика", часть 1: предложить пользователю короткие характеристики
+// товара на основе уже имеющегося анализа — бесплатно, кредиты не списываются.
+// Пользователь потом либо соглашается ("Подходит"), либо пишет свои.
+export const proposeCharacteristics = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) =>
+    z
+      .object({
+        analysis: z.string().min(1).max(4000),
+        prompt: z.string().max(2000).optional(),
+      })
+      .parse(data),
+  )
+  .handler(async ({ data }): Promise<{ characteristics: string[] }> => {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY is not configured");
+
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://exact-match.app",
+        "X-Title": "Exact Match",
+      },
+      body: JSON.stringify({
+        model: "openai/gpt-5-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Ты помощник продавца маркетплейса. По анализу товара составь 3-5 КОРОТКИХ характеристик " +
+              "(2-5 слов каждая) для инфографики на карточке товара — то, что покупатель увидит как выноски " +
+              "на фото (например: «Футболка с коротким рукавом», «Эластичный пояс со шнурком»). " +
+              "Отвечай СТРОГО в формате JSON-массива строк, без пояснений: [\"...\", \"...\"]",
+          },
+          {
+            role: "user",
+            content: `Анализ товара:\n${data.analysis}\n\nОписание от продавца: ${data.prompt ?? ""}`,
+          },
+        ],
+      }),
+    });
+
+    if (!resp.ok) throw new Error(`ai_error_${resp.status}`);
+    const json = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const raw = json.choices?.[0]?.message?.content?.trim() ?? "[]";
+    const cleaned = raw.replace(/^```json\s*|```$/g, "").trim();
+    let characteristics: string[] = [];
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed)) characteristics = parsed.filter((x) => typeof x === "string").slice(0, 5);
+    } catch {
+      // Модель не вернула валидный JSON — отдаём пустой список, фронтенд
+      // предложит пользователю написать характеристики самому.
+    }
+    return { characteristics };
+  });
+
+// Шаг "Инфографика", часть 2: сгенерировать вариант с выносками-характеристиками
+// поверх УЖЕ готового фото (referencing тот же результат, а не исходное фото
+// товара) — это отдельная платная генерация, кредиты списываются как за
+// обычный вариант.
+export const generateInfographicVariant = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) =>
+    z
+      .object({
+        baseImageUrl: z.string().url(),
+        characteristics: z.array(z.string().min(1).max(80)).min(1).max(6),
+        marketplace: z.enum(["wb", "ozon", "ym"]).default("wb"),
+      })
+      .parse(data),
+  )
+  .handler(async ({ data, context }): Promise<{ id: string; outputUrl: string; balance: number }> => {
+    const { supabase, userId } = context;
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY is not configured");
+
+    const preset = PRESETS[data.marketplace];
+    if (!preset.allowText) {
+      // Ozon/ЯМ строго запрещают текст на главном фото — инфографика для них
+      // не создаётся вообще, фронтенд не должен даже показывать эту кнопку
+      // для этих площадок, но на бэкенде тоже подстрахуемся.
+      throw new Error("infographic_not_allowed_for_marketplace");
+    }
+
+    const { data: newBalance, error: spendErr } = await supabase.rpc("spend_credits", {
+      _amount: CREDITS_COST_PER_VARIANT,
+    });
+    if (spendErr) {
+      if (spendErr.message.includes("insufficient_credits")) throw new Error("insufficient_credits");
+      throw new Error(spendErr.message);
+    }
+
+    const bulletsList = data.characteristics.map((c) => `— ${c}`).join("\n");
+    const infographicPrompt = `Возьми ЭТО ИЗОБРАЖЕНИЕ как основу и добавь поверх него инфографику-выноски (callout) в стиле карточки маркетплейса:
+${bulletsList}
+
+Требования:
+— НЕ меняй сам товар, фон, композицию, свет — они уже финальные, трогать нельзя.
+— Для каждой характеристики добавь: тонкую линию-выноску от соответствующей детали товара к небольшой подписи с текстом характеристики (кириллица, читаемый шрифт без засечек).
+— Подписи размещай по краям кадра, не перекрывая сам товар.
+— Стиль — чистый, коммерческий, как на реальных карточках Wildberries: белые/светлые плашки под текстом, тонкие линии-указатели, без лишней графики.
+— Не добавляй никакой другой текст, кроме перечисленных характеристик.`;
+
+    let gen: { id: string } | null = null;
+    try {
+      const { data: insData, error: insErr } = await supabase
+        .from("generations")
+        .insert({
+          user_id: userId,
+          prompt: infographicPrompt.slice(0, 500),
+          input_image_url: data.baseImageUrl,
+          status: "processing",
+          credits_cost: CREDITS_COST_PER_VARIANT,
+        })
+        .select("id")
+        .single();
+      if (insErr || !insData) throw new Error(insErr?.message ?? "insert_failed");
+      gen = insData;
+
+      const b64 = await callImageModel(
+        apiKey,
+        infographicPrompt,
+        data.baseImageUrl,
+        preset.aspectRatio,
+        "google/gemini-3.1-flash-image-preview",
+      );
+
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const path = `${userId}/${gen.id}.png`;
+      const { error: upErr } = await supabase.storage
+        .from("generations")
+        .upload(path, bytes, { contentType: "image/png", upsert: true });
+      if (upErr) throw new Error(`storage_error: ${upErr.message}`);
+
+      await supabase.from("generations").update({ status: "done", output_image_url: path }).eq("id", gen.id);
+      const { data: signed } = await supabase.storage.from("generations").createSignedUrl(path, 60 * 60);
+
+      return { id: gen.id, outputUrl: signed?.signedUrl ?? "", balance: newBalance as number };
+    } catch (err) {
+      if (gen) {
+        const message = err instanceof Error ? err.message : String(err);
+        await supabase.from("generations").update({ status: "failed", error: message }).eq("id", gen.id);
+      }
+      // Неудавшуюся инфографику возвращаем деньгами целиком — это отдельная
+      // разовая покупка, а не один из нескольких вариантов.
+      await supabase.rpc("refund_credits", { _amount: CREDITS_COST_PER_VARIANT }).catch(() => {});
+      throw err;
+    }
+  });
+
 export const generateCard = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: unknown) => InputSchema.parse(data))

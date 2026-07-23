@@ -19,7 +19,6 @@ import {
   Plus,
 } from "lucide-react";
 import { toast } from "sonner";
-import { CardOverlayEditor } from "@/components/card-overlay-editor";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -36,7 +35,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth";
 import { supabase } from "@/integrations/supabase/client";
-import { generateCard, analyzeProductStep } from "@/lib/ai.functions";
+import { generateCard, analyzeProductStep, proposeCharacteristics, generateInfographicVariant } from "@/lib/ai.functions";
 import { useMarketplace } from "@/lib/marketplace";
 
 export const Route = createFileRoute("/dashboard/")({
@@ -59,6 +58,8 @@ function NewGenerationPage() {
   const qc = useQueryClient();
   const generateFn = useServerFn(generateCard);
   const analyzeFn = useServerFn(analyzeProductStep);
+  const proposeFn = useServerFn(proposeCharacteristics);
+  const generateInfoFn = useServerFn(generateInfographicVariant);
 
   const { marketplace } = useMarketplace();
   const l = lang === "ru";
@@ -94,7 +95,14 @@ function NewGenerationPage() {
   const [variants, setVariants] = useState<{ id: string; outputUrl: string; modelLabel?: string }[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
-  const [overlayFor, setOverlayFor] = useState<string | null>(null);
+  type InfoState = {
+    status: "loading_proposal" | "choosing" | "custom_input" | "generating" | "done" | "error";
+    characteristics?: string[];
+    customText?: string;
+    resultUrl?: string;
+    errorMsg?: string;
+  };
+  const [infoByVariant, setInfoByVariant] = useState<Record<string, InfoState>>({});
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
 
   // Ozon / ЯМ требуют строго чистый фон без сцены — ограничиваем выбор сценария
@@ -194,6 +202,55 @@ function NewGenerationPage() {
     },
   });
 
+  const proposeMutation = useMutation({
+    mutationFn: async (variantId: string) => {
+      const res = await proposeFn({ data: { analysis: analysis ?? "", prompt } });
+      return { variantId, characteristics: res.characteristics };
+    },
+    onSuccess: ({ variantId, characteristics }) => {
+      setInfoByVariant((s) => ({
+        ...s,
+        [variantId]: {
+          status: characteristics.length > 0 ? "choosing" : "custom_input",
+          characteristics,
+        },
+      }));
+    },
+    onError: (err: Error, variantId) => {
+      setInfoByVariant((s) => ({ ...s, [variantId]: { status: "error", errorMsg: err.message } }));
+    },
+  });
+
+  const generateInfoMutation = useMutation({
+    mutationFn: async (vars: { variantId: string; baseImageUrl: string; characteristics: string[] }) => {
+      const res = await generateInfoFn({
+        data: { baseImageUrl: vars.baseImageUrl, characteristics: vars.characteristics, marketplace },
+      });
+      qc.invalidateQueries({ queryKey: ["credits", user?.id] });
+      return { variantId: vars.variantId, outputUrl: res.outputUrl };
+    },
+    onSuccess: ({ variantId, outputUrl }) => {
+      setInfoByVariant((s) => ({ ...s, [variantId]: { ...s[variantId], status: "done", resultUrl: outputUrl } }));
+    },
+    onError: (err: Error, vars) => {
+      setInfoByVariant((s) => ({
+        ...s,
+        [vars.variantId]: { ...s[vars.variantId], status: "error", errorMsg: err.message },
+      }));
+    },
+  });
+
+  const startProposeCharacteristics = (variantId: string) => {
+    setInfoByVariant((s) => ({ ...s, [variantId]: { status: "loading_proposal" } }));
+    proposeMutation.mutate(variantId);
+  };
+
+  const runGenerateInfographic = (variantId: string, baseImageUrl: string, characteristics: string[]) => {
+    if (characteristics.length === 0) return;
+    setInfoByVariant((s) => ({ ...s, [variantId]: { ...s[variantId], status: "generating", characteristics } }));
+    generateInfoMutation.mutate({ variantId, baseImageUrl, characteristics });
+  };
+
   const resetAll = () => {
     setStepIndex(0);
     setFile(null);
@@ -209,7 +266,7 @@ function NewGenerationPage() {
     setCompareModels(false);
     setVariants([]);
     setWarnings([]);
-    setOverlayFor(null);
+    setInfoByVariant({});
     setLightboxUrl(null);
   };
 
@@ -671,51 +728,126 @@ function NewGenerationPage() {
               variants.length > 1 ? "sm:grid-cols-2 lg:grid-cols-3" : "mx-auto max-w-sm"
             }`}
           >
-            {variants.map((v) => (
-              <div key={v.id} className="space-y-3">
-                {overlayFor === v.id ? (
-                  <div style={{ containerType: "inline-size" as const }}>
-                    <CardOverlayEditor
-                      imageUrl={v.outputUrl}
-                      lang={lang === "ru" ? "ru" : "en"}
-                      initial={{ title: prompt.split(/[.,\n]/)[0].slice(0, 40) || "Название товара" }}
+            {variants.map((v) => {
+              const info = infoByVariant[v.id];
+              const displayUrl = info?.resultUrl ?? v.outputUrl;
+              return (
+                <div key={v.id} className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setLightboxUrl(displayUrl)}
+                    className="block w-full cursor-zoom-in"
+                    title={l ? "Нажмите, чтобы увеличить" : "Click to enlarge"}
+                  >
+                    <img
+                      src={displayUrl}
+                      alt=""
+                      className="aspect-[3/4] w-full rounded-xl border border-border/60 object-cover"
                     />
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <button
-                      type="button"
-                      onClick={() => setLightboxUrl(v.outputUrl)}
-                      className="block w-full cursor-zoom-in"
-                      title={l ? "Нажмите, чтобы увеличить" : "Click to enlarge"}
-                    >
-                      <img
-                        src={v.outputUrl}
-                        alt=""
-                        className="aspect-[3/4] w-full rounded-xl border border-border/60 object-cover"
-                      />
-                    </button>
-                    {v.modelLabel && (
-                      <div className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
-                        <Sparkles className="h-3 w-3" />
-                        {v.modelLabel}
-                      </div>
-                    )}
-                    <div className="flex gap-2">
-                      <Button variant="outline" size="sm" asChild>
-                        <a href={v.outputUrl} download>
-                          {l ? "Скачать" : "Download"}
-                        </a>
-                      </Button>
-                      <Button variant="outline" size="sm" onClick={() => setOverlayFor(v.id)}>
+                  </button>
+                  {v.modelLabel && (
+                    <div className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+                      <Sparkles className="h-3 w-3" />
+                      {v.modelLabel}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" asChild>
+                      <a href={displayUrl} download>
+                        {l ? "Скачать" : "Download"}
+                      </a>
+                    </Button>
+                    {marketplace === "wb" && !info && (
+                      <Button variant="outline" size="sm" onClick={() => startProposeCharacteristics(v.id)}>
                         <LayoutGrid className="mr-2 h-4 w-4" />
                         {l ? "Инфографика" : "Infographic"}
                       </Button>
-                    </div>
+                    )}
                   </div>
-                )}
-              </div>
-            ))}
+
+                  {info?.status === "loading_proposal" && (
+                    <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-background/40 p-3 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      {l ? "Подбираю характеристики для инфографики..." : "Drafting characteristics..."}
+                    </div>
+                  )}
+
+                  {info?.status === "choosing" && info.characteristics && (
+                    <Card className="space-y-3 border-border/60 bg-background/40 p-3 text-sm">
+                      <div className="text-xs text-muted-foreground">
+                        {l ? "Напишу на карточке:" : "I'll put on the card:"}
+                      </div>
+                      <ul className="list-inside list-disc space-y-1">
+                        {info.characteristics.map((c, i) => (
+                          <li key={i}>{c}</li>
+                        ))}
+                      </ul>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => runGenerateInfographic(v.id, v.outputUrl, info.characteristics!)}
+                        >
+                          {l ? "Подходит" : "Looks good"}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setInfoByVariant((s) => ({ ...s, [v.id]: { ...s[v.id], status: "custom_input" } }))
+                          }
+                        >
+                          {l ? "Напишу свои характеристики" : "Write my own"}
+                        </Button>
+                      </div>
+                    </Card>
+                  )}
+
+                  {info?.status === "custom_input" && (
+                    <Card className="space-y-3 border-border/60 bg-background/40 p-3">
+                      <Label className="text-xs text-muted-foreground">
+                        {l ? "По одной характеристике на строку" : "One characteristic per line"}
+                      </Label>
+                      <Textarea
+                        rows={3}
+                        value={info.customText ?? ""}
+                        onChange={(e) =>
+                          setInfoByVariant((s) => ({ ...s, [v.id]: { ...s[v.id], customText: e.target.value } }))
+                        }
+                        placeholder={l ? "Футболка с коротким рукавом\nЭластичный пояс со шнурком" : "Short-sleeve tee\nElastic drawstring waist"}
+                      />
+                      <Button
+                        size="sm"
+                        onClick={() =>
+                          runGenerateInfographic(
+                            v.id,
+                            v.outputUrl,
+                            (info.customText ?? "")
+                              .split("\n")
+                              .map((s) => s.trim())
+                              .filter(Boolean),
+                          )
+                        }
+                      >
+                        {l ? "Сгенерировать инфографику" : "Generate infographic"}
+                      </Button>
+                    </Card>
+                  )}
+
+                  {info?.status === "generating" && (
+                    <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-background/40 p-3 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      {l ? "Рисую инфографику поверх фото..." : "Rendering infographic..."}
+                    </div>
+                  )}
+
+                  {info?.status === "error" && (
+                    <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+                      {info.errorMsg}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </Card>
       )}
